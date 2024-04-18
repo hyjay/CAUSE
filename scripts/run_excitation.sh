@@ -30,7 +30,7 @@ if [[ $* == *all* ]] || [[ $* == *preprocess* ]]; then
         --exp_decay 0.05  \
         --adj_spectral_radius 0.8 \
         --max_jumps 250 \
-        --n_splits $n_splits
+        --n_splits $n_splits \
         --fit
 fi
 
