@@ -76,157 +76,157 @@ def simulate_helper(hawkes, max_jumps):
     simu_hawkes.simulate()
     return simu_hawkes.timestamps
 
+if __name__ == "__main__":
+    args = get_parser().parse_args()
+    set_rand_seed(args.rand_seed)
+    print(args)
 
-args = get_parser().parse_args()
-set_rand_seed(args.rand_seed)
-print(args)
+    # simulate drug event_seqs
+    baseline = args.baseline * np.random.random(args.n_types)
+    adjacency = np.diag(np.random.random(args.n_types))
 
-# simulate drug event_seqs
-baseline = args.baseline * np.random.random(args.n_types)
-adjacency = np.diag(np.random.random(args.n_types))
+    if args.n_correlations > 0:
+        comb = list(permutations(range(args.n_types), 2))
+        idx = np.random.choice(
+            range(len(comb)), size=args.n_correlations, replace=False
+        )
+        comb = [comb[i] for i in idx]
+        for i, j in comb:
+            adjacency[i, j] = np.random.random()
 
-if args.n_correlations > 0:
-    comb = list(permutations(range(args.n_types), 2))
-    idx = np.random.choice(
-        range(len(comb)), size=args.n_correlations, replace=False
+    if args.constant_decay:
+        decays = np.full((args.n_types, args.n_types), args.exp_decay)
+    else:
+        decays = np.random.exponential(
+            args.exp_decay, (args.n_types, args.n_types)
+        )
+
+    simu_hawkes = SimuHawkesExpKernels(
+        baseline=baseline,
+        adjacency=adjacency,
+        decays=decays,
+        verbose=False,
+        seed=args.rand_seed,
     )
-    comb = [comb[i] for i in idx]
-    for i, j in comb:
-        adjacency[i, j] = np.random.random()
+    simu_hawkes.adjust_spectral_radius(args.adj_spectral_radius)
+    simu_hawkes.max_jumps = args.max_jumps
 
-if args.constant_decay:
-    decays = np.full((args.n_types, args.n_types), args.exp_decay)
-else:
-    decays = np.random.exponential(
-        args.exp_decay, (args.n_types, args.n_types)
-    )
+    print(simu_hawkes.baseline)
+    print(simu_hawkes.adjacency)
+    print(simu_hawkes.decays)
 
-simu_hawkes = SimuHawkesExpKernels(
-    baseline=baseline,
-    adjacency=adjacency,
-    decays=decays,
-    verbose=False,
-    seed=args.rand_seed,
-)
-simu_hawkes.adjust_spectral_radius(args.adj_spectral_radius)
-simu_hawkes.max_jumps = args.max_jumps
+    with Timer("Simulating events"), Pool(cpu_count() // 2) as p:
+        timestamps = list(
+            starmap(
+                simulate_helper,
+                zip(
+                    [simu_hawkes] * args.n_seqs,
+                    np.random.poisson(args.max_jumps, args.n_seqs),
+                ),
+            )
+        )
 
-print(simu_hawkes.baseline)
-print(simu_hawkes.adjacency)
-print(simu_hawkes.decays)
+    event_seqs = np.asarray([counting_proc_to_event_seq(cp) for cp in timestamps])
 
-with Timer("Simulating events"), Pool(cpu_count() // 2) as p:
-    timestamps = list(
-        starmap(
-            simulate_helper,
-            zip(
-                [simu_hawkes] * args.n_seqs,
-                np.random.poisson(args.max_jumps, args.n_seqs),
-            ),
+    with Timer("Computing intensity"), Pool(cpu_count() // 2) as p:
+        # NOTE: I/O seems to be a bottleneck
+        intensities = p.starmap(
+            get_intensity_exp_hawkes, zip([simu_hawkes] * args.n_seqs, event_seqs)
+        )
+
+        # computing the optimal acc for predicting the event types
+        tmp = []
+        for i in range(len(event_seqs)):
+            for j in range(len(event_seqs[i])):
+                tmp.append((event_seqs[i][j][1], np.argmax(intensities[i][j])))
+        print("Optimal acc = {:4f}".format(sum(x == y for x, y in tmp) / len(tmp)))
+
+    dataset = f"{args.name}-{args.n_seqs // 1000}K-{args.n_types}"
+    output_path = f"data/input/{dataset}"
+
+    makedirs([output_path])
+    export_json(vars(args), osp.join(output_path, "config.json"))
+
+    train_test_splits = list(
+        KFold(args.n_splits, shuffle=True, random_state=args.rand_seed).split(
+            range(len(event_seqs))
         )
     )
 
-event_seqs = np.asarray([counting_proc_to_event_seq(cp) for cp in timestamps])
+    with open(osp.join(output_path, "statistics.txt"), "w") as f:
+        report = get_event_seqs_report(event_seqs, args.n_types)
+        print(report)
+        f.writelines(report)
 
-with Timer("Computing intensity"), Pool(cpu_count() // 2) as p:
-    # NOTE: I/O seems to be a bottleneck
-    intensities = p.starmap(
-        get_intensity_exp_hawkes, zip([simu_hawkes] * args.n_seqs, event_seqs)
+
+    np.savez_compressed(
+        osp.join(output_path, "data.npz"),
+        event_seqs=event_seqs,
+        train_test_splits=train_test_splits,
+        intensities=intensities,
+        n_types=args.n_types,
     )
 
-    # computing the optimal acc for predicting the event types
-    tmp = []
-    for i in range(len(event_seqs)):
-        for j in range(len(event_seqs[i])):
-            tmp.append((event_seqs[i][j][1], np.argmax(intensities[i][j])))
-    print("Optimal acc = {:4f}".format(sum(x == y for x, y in tmp) / len(tmp)))
-
-dataset = f"{args.name}-{args.n_seqs // 1000}K-{args.n_types}"
-output_path = f"data/input/{dataset}"
-
-makedirs([output_path])
-export_json(vars(args), osp.join(output_path, "config.json"))
-
-train_test_splits = list(
-    KFold(args.n_splits, shuffle=True, random_state=args.rand_seed).split(
-        range(len(event_seqs))
+    np.savez_compressed(
+        osp.join(output_path, "params.npz"),
+        hawkes_baseline=simu_hawkes.baseline,
+        hawkes_adjacency=simu_hawkes.adjacency,
+        hawkes_decays=simu_hawkes.decays,
     )
-)
 
-with open(osp.join(output_path, "statistics.txt"), "w") as f:
-    report = get_event_seqs_report(event_seqs, args.n_types)
-    print(report)
-    f.writelines(report)
+    np.savetxt(osp.join(output_path, "infectivity.txt"), simu_hawkes.adjacency)
 
+    # evaluate
+    results = []
+    for train_idxs, test_idxs in tqdm(train_test_splits):
 
-np.savez_compressed(
-    osp.join(output_path, "data.npz"),
-    event_seqs=event_seqs,
-    train_test_splits=train_test_splits,
-    intensities=intensities,
-    n_types=args.n_types,
-)
-
-np.savez_compressed(
-    osp.join(output_path, "params.npz"),
-    hawkes_baseline=simu_hawkes.baseline,
-    hawkes_adjacency=simu_hawkes.adjacency,
-    hawkes_decays=simu_hawkes.decays,
-)
-
-np.savetxt(osp.join(output_path, "infectivity.txt"), simu_hawkes.adjacency)
-
-# evaluate
-results = []
-for train_idxs, test_idxs in tqdm(train_test_splits):
-
-    res = {}
-    res["nll"] = eval_nll_hawkes_exp_kern(event_seqs[test_idxs], simu_hawkes)
-    event_seqs_pred = predict_next_event_hawkes_exp_kern(
-        event_seqs[test_idxs], simu_hawkes
-    )
-    res["rmse"] = calc_root_mean_square_error(
-        event_seqs[test_idxs], event_seqs_pred
-    )
-    res["mae"] = calc_mean_absolute_error(
-        event_seqs[test_idxs], event_seqs_pred
-    )
-    results.append(res)
-
-time = pd.Timestamp.now()
-df = pd.DataFrame(
-    columns=[
-        "timestamp",
-        "dataset",
-        "split_id",
-        "model",
-        "metric",
-        "value",
-        "config",
-    ]
-)
-
-for split_id, res in enumerate(results):
-    for metric_name, val in res.items():
-
-        df.loc[len(df)] = (
-            time,
-            dataset,
-            split_id,
-            "Groundtruth",
-            metric_name,
-            val,
-            vars(args),
+        res = {}
+        res["nll"] = eval_nll_hawkes_exp_kern(event_seqs[test_idxs], simu_hawkes)
+        event_seqs_pred = predict_next_event_hawkes_exp_kern(
+            event_seqs[test_idxs], simu_hawkes
         )
-
-export_csv(df, "data/output/results.csv", append=True)
-
-if args.fit:
-    with Timer("Fitting a hawkes process"):
-        learner = HawkesExpKern(
-            decays=np.full((args.n_types, args.n_types), args.exp_decay)
+        res["rmse"] = calc_root_mean_square_error(
+            event_seqs[test_idxs], event_seqs_pred
         )
-        learner.fit(timestamps)
+        res["mae"] = calc_mean_absolute_error(
+            event_seqs[test_idxs], event_seqs_pred
+        )
+        results.append(res)
 
-    print(learner.baseline)
-    print(learner.adjacency)
+    time = pd.Timestamp.now()
+    df = pd.DataFrame(
+        columns=[
+            "timestamp",
+            "dataset",
+            "split_id",
+            "model",
+            "metric",
+            "value",
+            "config",
+        ]
+    )
+
+    for split_id, res in enumerate(results):
+        for metric_name, val in res.items():
+
+            df.loc[len(df)] = (
+                time,
+                dataset,
+                split_id,
+                "Groundtruth",
+                metric_name,
+                val,
+                vars(args),
+            )
+
+    export_csv(df, "data/output/results.csv", append=True)
+
+    if args.fit:
+        with Timer("Fitting a hawkes process"):
+            learner = HawkesExpKern(
+                decays=np.full((args.n_types, args.n_types), args.exp_decay)
+            )
+            learner.fit(timestamps)
+
+        print(learner.baseline)
+        print(learner.adjacency)
